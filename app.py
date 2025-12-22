@@ -1,6 +1,11 @@
 import math
 import streamlit as st
 
+# ============================
+# SPY Options Size Checker
+# (with estimated regulatory fees)
+# ============================
+
 # ----------------------------
 # CONFIG (EDIT AS YOU LIKE)
 # ----------------------------
@@ -38,6 +43,22 @@ TRADE2_TIGHTENING_RULES = [
 SL_TRADE2_MIN = 12.0
 SL_TRADE2_MAX = 22.0
 
+# ----------------------------
+# FEES (ESTIMATES)
+# ----------------------------
+# Webull usually has $0 commission and $0 OCC clearing fee, but you WILL see regulatory fees
+# that scale with contract count and can vary slightly by day.
+#
+# We'll model them conservatively:
+# - ORF (Options Regulatory Fee): ~ $0.013–$0.015 per contract, varies. We'll default to 0.015.
+# - Optional "other" per-contract fees (kept at 0 by default). Use if you ever see them.
+DEFAULT_ORF_PER_CONTRACT = 0.015
+DEFAULT_OTHER_FEES_PER_CONTRACT = 0.000
+
+# Apply fees on round-trip (buy + sell). Most regulatory fees show on sells,
+# but modeling round-trip is conservative and keeps you from overestimating edge.
+ROUND_TRIP_FEES = True
+
 
 # ----------------------------
 # HELPERS
@@ -65,6 +86,7 @@ def trade2_dynamic_sl(entry_price):
     return max(SL_TRADE2_MIN, min(SL_TRADE2_MAX, sl))
 
 def compute_tp_percent_for_target_account_gain(balance, entry_price, contracts, target_account_gain_pct):
+    """TP% (on option premium) needed to hit target % gain on account, ignoring fees (we display fees separately)."""
     if contracts <= 0 or balance <= 0 or entry_price <= 0:
         return None
     profit_goal = balance * (target_account_gain_pct / 100.0)
@@ -73,13 +95,26 @@ def compute_tp_percent_for_target_account_gain(balance, entry_price, contracts, 
         return None
     return (profit_goal / denom) * 100.0
 
-def calc(balance, entry_price, trade_number, mode_target_gain, target_gain_pct, tp_pct_manual):
+def est_fees(contracts, orf_per_contract, other_per_contract, round_trip):
+    """
+    Estimate fees.
+    By default, fees are modeled per contract.
+    If round_trip=True, multiply by 2 (entry + exit) to be conservative.
+    """
+    per_contract = max(0.0, orf_per_contract) + max(0.0, other_per_contract)
+    total = contracts * per_contract
+    return total * (2.0 if round_trip else 1.0)
+
+def calc(balance, entry_price, trade_number, mode_target_gain, target_gain_pct, tp_pct_manual,
+         orf_per_contract, other_fees_per_contract, round_trip_fees):
+
     inv_pct = invest_percent(balance, trade_number)
     rsk_pct = risk_percent(balance)
 
     inv_budget = balance * inv_pct / 100.0
     rsk_budget = balance * rsk_pct / 100.0
 
+    # SL% rule (option-premium based)
     sl_pct = SL_TRADE1_BASE if trade_number == 1 else trade2_dynamic_sl(entry_price)
 
     cost_per_contract = entry_price * 100.0
@@ -90,6 +125,7 @@ def calc(balance, entry_price, trade_number, mode_target_gain, target_gain_pct, 
     max_by_risk = math.floor(rsk_budget / loss_per_contract) if loss_per_contract > 0 else 0
     contracts = max(0, min(max_by_invest, max_by_risk))
 
+    # TP% rule
     if mode_target_gain:
         tp_pct = compute_tp_percent_for_target_account_gain(balance, entry_price, contracts, target_gain_pct)
         tp_pct = tp_pct if tp_pct is not None else 0.0
@@ -98,12 +134,24 @@ def calc(balance, entry_price, trade_number, mode_target_gain, target_gain_pct, 
 
     tp_price = entry_price * (1.0 + tp_pct / 100.0)
 
+    # Position economics (gross)
     pos_cost = contracts * cost_per_contract
-    profit_tp = (tp_price - entry_price) * 100.0 * contracts
-    loss_sl = (entry_price - sl_price) * 100.0 * contracts
+    gross_profit_tp = (tp_price - entry_price) * 100.0 * contracts
+    gross_loss_sl = (entry_price - sl_price) * 100.0 * contracts
 
-    acct_gain_tp = (profit_tp / balance * 100.0) if balance > 0 else 0.0
-    acct_loss_sl = (loss_sl / balance * 100.0) if balance > 0 else 0.0
+    # Fees (estimated)
+    total_fees = est_fees(contracts, orf_per_contract, other_fees_per_contract, round_trip_fees)
+
+    # Net economics (after fees)
+    net_profit_tp = gross_profit_tp - total_fees
+    net_loss_sl = gross_loss_sl + total_fees  # fees worsen the loss scenario
+
+    # Account impact
+    acct_gain_tp_gross = (gross_profit_tp / balance * 100.0) if balance > 0 else 0.0
+    acct_loss_sl_gross = (gross_loss_sl / balance * 100.0) if balance > 0 else 0.0
+
+    acct_gain_tp_net = (net_profit_tp / balance * 100.0) if balance > 0 else 0.0
+    acct_loss_sl_net = (net_loss_sl / balance * 100.0) if balance > 0 else 0.0
 
     return {
         "contracts": contracts,
@@ -115,12 +163,22 @@ def calc(balance, entry_price, trade_number, mode_target_gain, target_gain_pct, 
         "pos_cost": pos_cost,
         "tp_price": tp_price,
         "sl_price": sl_price,
-        "profit_tp": profit_tp,
-        "loss_sl": loss_sl,
         "max_by_invest": max_by_invest,
         "max_by_risk": max_by_risk,
-        "acct_gain_tp": acct_gain_tp,
-        "acct_loss_sl": acct_loss_sl,
+
+        "fees_est": total_fees,
+
+        "gross_profit_tp": gross_profit_tp,
+        "gross_loss_sl": gross_loss_sl,
+
+        "net_profit_tp": net_profit_tp,
+        "net_loss_sl": net_loss_sl,
+
+        "acct_gain_tp_gross": acct_gain_tp_gross,
+        "acct_loss_sl_gross": acct_loss_sl_gross,
+
+        "acct_gain_tp_net": acct_gain_tp_net,
+        "acct_loss_sl_net": acct_loss_sl_net,
     }
 
 
@@ -166,15 +224,12 @@ html, body, [class*="css"] {{
   font-size: 0.95rem;
   line-height: 1.35rem;
 }}
-/* Make inputs & buttons more tappable on mobile */
 button[kind="primary"], button[kind="secondary"] {{
   border-radius: 12px !important;
 }}
-/* Reduce metric overflow on small screens */
 [data-testid="stMetricValue"] {{
   font-size: 1.35rem;
 }}
-/* On small screens, tighten padding and stack nicely */
 @media (max-width: 700px) {{
   .block-container {{
     padding-left: 0.9rem;
@@ -188,7 +243,11 @@ button[kind="primary"], button[kind="secondary"] {{
 """, unsafe_allow_html=True)
 
 st.title("SPY Options Size Checker")
-st.markdown('<div class="small">Phone + desktop friendly. Auto-sizes contracts using deploy/risk tiers, tightens SL on trade #2, and supports fixed TP% or target account-gain mode.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="small">Phone + desktop friendly. Auto-sizes contracts using deploy/risk tiers, tightens SL on trade #2, '
+    'supports fixed TP% or target account-gain mode, and estimates regulatory fees so you can see NET results.</div>',
+    unsafe_allow_html=True
+)
 
 st.write("")
 
@@ -199,8 +258,20 @@ with c1:
     entry_price = st.number_input("Entry price (option premium)", min_value=0.01, value=0.25, step=0.01, format="%.2f")
 with c2:
     trade_number = st.radio("Trade of the week", [1, 2], horizontal=True)
-    st.caption("1 = main trade • 2 = reduced trade")
+    st.caption("1 = main trade • 2 = reduced trade (deploy% is halved)")
 
+st.write("")
+
+# Fees section (kept simple; optional to edit)
+st.subheader("Fees (estimated)")
+f1, f2, f3 = st.columns([1, 1, 1])
+with f1:
+    orf_per_contract = st.number_input("ORF $/contract (estimate)", min_value=0.0, value=DEFAULT_ORF_PER_CONTRACT, step=0.001, format="%.3f")
+with f2:
+    other_fees_per_contract = st.number_input("Other $/contract (optional)", min_value=0.0, value=DEFAULT_OTHER_FEES_PER_CONTRACT, step=0.001, format="%.3f")
+with f3:
+    round_trip_fees = st.toggle("Round-trip fees (conservative)", value=ROUND_TRIP_FEES)
+st.caption("Tip: ORF often looks like ~$0.013–$0.015/contract, but can vary by day. Round-trip mode is conservative.")
 st.write("")
 
 mode_target_gain = st.toggle("🎯 Target account % gain (auto TP%)", value=True)
@@ -211,9 +282,19 @@ else:
     target_gain_pct = 1.0
     tp_pct_manual = st.slider("Fixed TP (%) on option premium", 2.0, 30.0, 10.0, 0.5)
 
-res = calc(balance, entry_price, trade_number, mode_target_gain, target_gain_pct, tp_pct_manual)
+res = calc(
+    balance=balance,
+    entry_price=entry_price,
+    trade_number=trade_number,
+    mode_target_gain=mode_target_gain,
+    target_gain_pct=target_gain_pct,
+    tp_pct_manual=tp_pct_manual,
+    orf_per_contract=orf_per_contract,
+    other_fees_per_contract=other_fees_per_contract,
+    round_trip_fees=round_trip_fees,
+)
 
-# Summary (keep to max 2 columns for mobile readability)
+# Summary
 st.markdown('<div class="card">', unsafe_allow_html=True)
 s1, s2 = st.columns(2)
 with s1:
@@ -229,7 +310,7 @@ if res["contracts"] == 0:
 
 st.write("")
 
-# Exit Levels (2 columns so mobile doesn’t squish)
+# Exit Levels
 st.subheader("Exit Levels")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 e1, e2 = st.columns(2)
@@ -240,13 +321,30 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 st.write("")
 
-# P&L (2 columns for mobile)
-st.subheader("P&L at TP/SL")
+# Fees & P&L
+st.subheader("Fees + P&L at TP/SL (Gross vs Net)")
 st.markdown('<div class="card">', unsafe_allow_html=True)
+
+st.metric("Estimated Fees", f'${res["fees_est"]:.2f}')
+
 p1, p2 = st.columns(2)
-p1.metric("Profit at TP", f'${res["profit_tp"]:.2f}')
-p2.metric("Loss at SL", f'${res["loss_sl"]:.2f}')
-st.caption(f"Account impact → TP: {res['acct_gain_tp']:.2f}% • SL: {res['acct_loss_sl']:.2f}%")
+with p1:
+    st.markdown("**At TP**")
+    st.metric("Profit (Gross)", f'${res["gross_profit_tp"]:.2f}')
+    st.metric("Profit (Net)", f'${res["net_profit_tp"]:.2f}')
+    st.caption(f"Account impact → Gross: {res['acct_gain_tp_gross']:.2f}% • Net: {res['acct_gain_tp_net']:.2f}%")
+with p2:
+    st.markdown("**At SL**")
+    st.metric("Loss (Gross)", f'${res["gross_loss_sl"]:.2f}')
+    st.metric("Loss (Net)", f'${res["net_loss_sl"]:.2f}')
+    st.caption(f"Account impact → Gross: {res['acct_loss_sl_gross']:.2f}% • Net: {res['acct_loss_sl_net']:.2f}%")
+
+# Soft warning if fees eat too much of gross profit
+if res["gross_profit_tp"] > 0:
+    fee_pct_of_profit = (res["fees_est"] / res["gross_profit_tp"]) * 100.0
+    if fee_pct_of_profit >= 10.0:
+        st.warning(f"Fees are ~{fee_pct_of_profit:.1f}% of your gross TP profit. Consider larger TP%, fewer contracts, or skip this setup.")
+
 st.markdown('</div>', unsafe_allow_html=True)
 
 st.write("")
@@ -265,14 +363,18 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 st.write("")
 
-# Copy-ready block (best cross-platform)
+# Copy-ready block
 st.subheader("Copy-ready plan")
 copy_text = (
     f"ENTRY ${entry_price:.2f} | CONTRACTS {res['contracts']} | "
     f"TP ${res['tp_price']:.2f} (TP% {res['tp_pct']:.2f}) | "
     f"SL ${res['sl_price']:.2f} (SL% {res['sl_pct']:.2f}) | "
-    f"POS COST ${res['pos_cost']:.2f} | P@TP ${res['profit_tp']:.2f} | L@SL ${res['loss_sl']:.2f}"
+    f"POS COST ${res['pos_cost']:.2f} | "
+    f"FEES~ ${res['fees_est']:.2f} | "
+    f"P@TP Gross ${res['gross_profit_tp']:.2f} / Net ${res['net_profit_tp']:.2f} | "
+    f"L@SL Gross ${res['gross_loss_sl']:.2f} / Net ${res['net_loss_sl']:.2f}"
 )
 st.code(copy_text, language="text")
 st.caption("Chromebook tip: tap-and-hold or drag-select to copy. Desktop: highlight + Ctrl/Cmd+C.")
 st.caption("Not financial advice. Tool is for sizing/risk math only.")
+```0
