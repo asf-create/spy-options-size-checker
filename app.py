@@ -377,4 +377,3 @@ copy_text = (
 st.code(copy_text, language="text")
 st.caption("Chromebook tip: tap-and-hold or drag-select to copy. Desktop: highlight + Ctrl/Cmd+C.")
 st.caption("Not financial advice. Tool is for sizing/risk math only.")
-```0
