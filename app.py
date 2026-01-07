@@ -5,6 +5,9 @@ import streamlit as st
 # CONFIG (EDIT AS YOU LIKE)
 # ----------------------------
 
+# Exchange tick size for SPY options (usually $0.01)
+MIN_TICK = 0.01
+
 # Path D – deploy tiers: as account grows, % deployed per main trade shrinks.
 # These are for Trade #1; Trade #2 automatically uses half of this.
 INVEST_TIERS = [
@@ -81,7 +84,7 @@ def trade2_dynamic_sl(entry_price):
 def compute_tp_percent_for_target_account_gain(balance, entry_price, contracts, target_account_gain_pct):
     """
     Given a desired ACCOUNT % gain for the trade, compute needed TP% on the option premium.
-    All the 'target %' here is based on ACCOUNT BALANCE, not contract.
+    The 'target %' here is based on ACCOUNT BALANCE, not the contract.
     """
     if contracts <= 0 or balance <= 0 or entry_price <= 0:
         return None
@@ -124,8 +127,22 @@ def calc(balance, entry_price, trade_number,
     else:
         tp_pct = tp_pct_manual
 
-    tp_price = entry_price * (1.0 + tp_pct / 100.0)
+    # --- TP price with tick rounding ---
+    # Raw theoretical TP from account target
+    tp_price_raw = entry_price * (1.0 + tp_pct / 100.0)
+    tp_price = tp_price_raw
 
+    if contracts > 0 and entry_price > 0 and tp_pct > 0:
+        # Move TP to the nearest tick ABOVE entry (at least one tick up)
+        diff = tp_price_raw - entry_price
+        ticks = math.ceil(diff / MIN_TICK)
+        if ticks <= 0:
+            ticks = 1
+        tp_price = entry_price + ticks * MIN_TICK
+        # Recompute effective TP% on premium using the rounded TP price
+        tp_pct = ((tp_price / entry_price) - 1.0) * 100.0
+
+    # Position P&L based on rounded TP price
     pos_cost = contracts * cost_per_contract
     profit_tp = (tp_price - entry_price) * 100.0 * contracts
     loss_sl = (entry_price - sl_price) * 100.0 * contracts
@@ -222,7 +239,8 @@ st.title("SPY Options Size Checker")
 st.markdown(
     '<div class="small">'
     "Phone + desktop friendly. Auto-sizes contracts using Path D tiers, caps risk ~1–2% of account, "
-    "uses SPY-aware SLs, and ALWAYS aims for a target % gain on the TOTAL ACCOUNT (not the contract)."
+    "uses SPY-aware SLs, and ALWAYS aims for a target % gain on the TOTAL ACCOUNT (not the contract). "
+    "TP prices are snapped to the nearest $0.01 tick above entry."
     "</div>",
     unsafe_allow_html=True,
 )
@@ -306,7 +324,7 @@ e1, e2 = st.columns(2)
 e1.metric("TP Price", f'${res["tp_price"]:.2f}')
 e2.metric("SL Price", f'${res["sl_price"]:.2f}')
 st.caption(
-    f"SL % used: {res['sl_pct']:.1f}% • TP % on premium (auto from account target): {res['tp_pct']:.2f}%"
+    f"SL % used: {res['sl_pct']:.1f}% • TP % on premium (after tick rounding): {res['tp_pct']:.2f}%"
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -385,8 +403,8 @@ st.write(
     f"Max contracts by risk: **{res['max_by_risk']}**"
 )
 st.write(
-    f"Target ACCOUNT gain (gross): **{target_gain_pct:.2f}%** → "
-    f"required TP% on premium (auto): **{res['tp_pct']:.2f}%**"
+    f"Requested target ACCOUNT gain: **{target_gain_pct:.2f}%** → "
+    f"actual from tick/sizing: **{res['acct_gain_tp']:.2f}%** (gross)."
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
