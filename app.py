@@ -4,7 +4,7 @@ MIN_TICK = 0.01 # SPY options tick size
 # As account grows, % deployed per main trade shrinks.INVEST_TIERS = [    (25000, 35.0),    (100000, 25.0),    (300000, 15.0),    (float("inf"), 8.0),]
 # Risk tiers — cap account risk per trade around ~1–2%RISK_TIERS = [    (25000, 2.0),    (100000, 1.8),    (300000, 1.5),    (float("inf"), 1.2),]
 # Base SL on option premiumSL_TRADE1_BASE = 30.0SL_TRADE2_BASE = 24.0
-TRADE2_TIGHTENING_RULES = [    (0.25, 4.0),    (0.35, 3.0),    (0.50, 2.0),    (float("inf"), 0.0),]
+TRADE2_TIGHTENING_RULES = [(0.25, 4.0),    (0.35, 3.0),    (0.50, 2.0),    (float("inf"), 0.0),]
 SL_TRADE2_MIN = 15.0SL_TRADE2_MAX = 26.0
 # Target account-gain guidanceMIN_GOAL_ACCT_GAIN = 0.20MAX_GOAL_ACCT_GAIN = 1.00
 
