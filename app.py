@@ -22,7 +22,7 @@ RISK_TIERS = [
     (float("inf"), 1.2), # 300k+ → 1.2%
 ]
 
-# Default TP% on the option premium when not in account-target mode
+# Default TP% on the option premium (used internally when we solve for account %)
 DEFAULT_TP_PERCENT = 10.0
 
 # Base SL on option premium (wider to respect SPY volatility and reduce over-sizing)
@@ -39,9 +39,9 @@ TRADE2_TIGHTENING_RULES = [
 SL_TRADE2_MIN = 15.0     # Floor for SL% on trade 2
 SL_TRADE2_MAX = 26.0     # Ceiling for SL% on trade 2
 
-# Soft guidance for account impact
-MIN_GOAL_ACCT_GAIN = 0.20   # min useful account gain %
-MAX_GOAL_ACCT_GAIN = 3.00   # max sane account gain % for this tool
+# Soft guidance for account impact (all based on ACCOUNT %, not premium)
+MIN_GOAL_ACCT_GAIN = 0.20   # min useful account gain per trade
+MAX_GOAL_ACCT_GAIN = 1.00   # max target account gain per trade
 
 
 # ----------------------------
@@ -80,7 +80,8 @@ def trade2_dynamic_sl(entry_price):
 
 def compute_tp_percent_for_target_account_gain(balance, entry_price, contracts, target_account_gain_pct):
     """
-    Given a desired account % gain for the trade, compute needed TP% on the option premium.
+    Given a desired ACCOUNT % gain for the trade, compute needed TP% on the option premium.
+    All the 'target %' here is based on ACCOUNT BALANCE, not contract.
     """
     if contracts <= 0 or balance <= 0 or entry_price <= 0:
         return None
@@ -116,7 +117,7 @@ def calc(balance, entry_price, trade_number,
     max_by_risk = math.floor(rsk_budget / loss_per_contract) if loss_per_contract > 0 else 0
     contracts = max(0, min(max_by_invest, max_by_risk))
 
-    # TP% on the premium, either derived from account target or fixed manually
+    # ALWAYS in account-target mode now
     if mode_target_gain:
         tp_pct = compute_tp_percent_for_target_account_gain(balance, entry_price, contracts, target_gain_pct)
         tp_pct = tp_pct if tp_pct is not None else 0.0
@@ -221,7 +222,7 @@ st.title("SPY Options Size Checker")
 st.markdown(
     '<div class="small">'
     "Phone + desktop friendly. Auto-sizes contracts using Path D tiers, caps risk ~1–2% of account, "
-    "uses SPY-aware SLs, and supports fixed TP% or target account-gain mode with optional Turbo Light trades."
+    "uses SPY-aware SLs, and ALWAYS aims for a target % gain on the TOTAL ACCOUNT (not the contract)."
     "</div>",
     unsafe_allow_html=True,
 )
@@ -241,7 +242,7 @@ with c1:
     )
 with c2:
     trade_number = st.radio("Trade of the week", [1, 2], horizontal=True)
-    st.caption("1 = main trade • 2 = reduced trade (half deploy, tighter SL)")
+    st.caption("1 = main trade • 2 = secondary trade (half deploy, tighter SL)")
 
 st.write("")
 
@@ -255,50 +256,23 @@ est_fee_per_contract = st.number_input(
     help="Rough average of SEC/OCC/regulatory fees per contract. Used to show net P&L after fees."
 )
 
-# Turbo light toggle
-turbo_mode = st.toggle("⚡ Turbo light trade (optional high-conviction)", value=False)
-if turbo_mode:
-    st.caption(
-        "Turbo light: same risk rules, but higher account/TP target for this trade "
-        "(e.g., a 2–3% ‘special’ trade, still within your global risk rules)."
-    )
-
-# Mode: target account gain vs fixed TP%
-mode_target_gain = st.toggle("🎯 Target account % gain (auto TP%)", value=True)
-
-if mode_target_gain:
-    # Align defaults with your realistic net weekly structure:
-    # Trade 1 → ~0.9% account gain target
-    # Trade 2 → ~0.3% account gain target
-    if turbo_mode:
-        default_target_gain = 2.5   # Turbo: heavier but still <= 3%
-    else:
-        default_target_gain = 0.9 if trade_number == 1 else 0.3
-
-    target_gain_pct = st.slider(
-        "Target gain on TOTAL account (%)",
-        MIN_GOAL_ACCT_GAIN,
-        MAX_GOAL_ACCT_GAIN,
-        default_target_gain,
-        0.05,
-    )
-    tp_pct_manual = DEFAULT_TP_PERCENT
+# Always in account-target mode, 0.20–1.00% band
+if trade_number == 1:
+    default_target_gain = 0.8  # main trade target (you can tweak)
 else:
-    target_gain_pct = 1.0
-    # In turbo mode, default to a higher premium TP% (e.g., 20% instead of 10%)
-    if turbo_mode:
-        default_tp_pct = 20.0
-    else:
-        default_tp_pct = DEFAULT_TP_PERCENT
-    tp_pct_manual = st.slider(
-        "Fixed TP (%) on option premium",
-        2.0,
-        40.0,
-        default_tp_pct,
-        0.5,
-    )
+    default_target_gain = 0.4  # secondary trade target
 
-# Core calculations
+target_gain_pct = st.slider(
+    "Target gain on TOTAL account (%)",
+    MIN_GOAL_ACCT_GAIN,
+    MAX_GOAL_ACCT_GAIN,
+    default_target_gain,
+    0.05,
+)
+
+# Core calculations (mode_target_gain is always True now)
+mode_target_gain = True
+tp_pct_manual = DEFAULT_TP_PERCENT
 res = calc(balance, entry_price, trade_number, mode_target_gain, target_gain_pct, tp_pct_manual)
 
 # Compute fee-adjusted P&L and net account gain
@@ -332,8 +306,7 @@ e1, e2 = st.columns(2)
 e1.metric("TP Price", f'${res["tp_price"]:.2f}')
 e2.metric("SL Price", f'${res["sl_price"]:.2f}')
 st.caption(
-    f"SL % used: {res['sl_pct']:.1f}% • TP % used: {res['tp_pct']:.2f}%"
-    + (" • Turbo Light ON" if turbo_mode else "")
+    f"SL % used: {res['sl_pct']:.1f}% • TP % on premium (auto from account target): {res['tp_pct']:.2f}%"
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -346,7 +319,8 @@ p1, p2 = st.columns(2)
 p1.metric("Gross Profit at TP", f'${res["profit_tp"]:.2f}')
 p2.metric("Loss at SL", f'${res["loss_sl"]:.2f}')
 st.caption(
-    f"Gross account impact → TP: {res['acct_gain_tp']:.2f}% • SL: {res['acct_loss_sl']:.2f}%"
+    f"Gross account impact → TP: {res['acct_gain_tp']:.2f}% • SL: {res['acct_loss_sl']:.2f}% "
+    "(all based on ACCOUNT balance, not contract)."
 )
 st.write(f"Estimated total fees: **${total_est_fees:.2f}**")
 st.write(f"Net profit at TP (after est. fees): **${net_profit_tp:.2f}**")
@@ -356,7 +330,7 @@ st.markdown('</div>', unsafe_allow_html=True)
 st.write("")
 
 # Weekly goal + risk guidance (use NET gain for guidance)
-st.subheader("Goal & Risk Checks")
+st.subheader("Goal & Risk Checks (account-based)")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 
 g_net = net_acct_gain_tp
@@ -368,16 +342,16 @@ else:
     if g_net < MIN_GOAL_ACCT_GAIN:
         st.info(
             f"This trade targets only ~{g_net:.2f}% NET account gain — smaller than your 0.20%+ guidance. "
-            "That’s totally fine if the setup is weaker or you want extra safety."
+            "That’s fine if the setup is weaker or you want extra safety."
         )
     elif g_net > MAX_GOAL_ACCT_GAIN:
         st.warning(
-            f"This trade targets ~{g_net:.2f}% NET account gain, above the 3% guidance. "
-            "Strongly consider reducing size or lowering your target."
+            f"This trade targets ~{g_net:.2f}% NET account gain, above the 1.00% per-trade guidance. "
+            "Consider reducing contracts or lowering the target."
         )
     else:
         st.success(
-            f"This trade targets ~{g_net:.2f}% NET account gain — inside your 0.20%–3.00% goal band."
+            f"This trade targets ~{g_net:.2f}% NET account gain — inside your 0.20%–1.00% goal band."
         )
 
 # Soft cap on account % loss at SL per trade type
@@ -410,13 +384,10 @@ st.write(
     f"Max contracts by deploy: **{res['max_by_invest']}** • "
     f"Max contracts by risk: **{res['max_by_risk']}**"
 )
-if mode_target_gain:
-    st.write(
-        f"Target account gain (gross): **{target_gain_pct:.2f}%** → TP% on premium (auto): "
-        f"**{res['tp_pct']:.2f}%**"
-    )
-else:
-    st.write(f"TP% on premium (fixed): **{res['tp_pct']:.2f}%**")
+st.write(
+    f"Target ACCOUNT gain (gross): **{target_gain_pct:.2f}%** → "
+    f"required TP% on premium (auto): **{res['tp_pct']:.2f}%**"
+)
 st.markdown('</div>', unsafe_allow_html=True)
 
 st.write("")
@@ -425,15 +396,13 @@ st.write("")
 st.subheader("Copy-ready plan")
 copy_text = (
     f"ENTRY ${entry_price:.2f} | CONTRACTS {res['contracts']} | "
-    f"TP ${res['tp_price']:.2f} (TP% {res['tp_pct']:.2f}) | "
+    f"TP ${res['tp_price']:.2f} (TP% on premium {res['tp_pct']:.2f}) | "
     f"SL ${res['sl_price']:.2f} (SL% {res['sl_pct']:.2f}) | "
     f"POS COST ${res['pos_cost']:.2f} | "
     f"GROSS P@TP ${res['profit_tp']:.2f} | L@SL ${res['loss_sl']:.2f} | "
     f"FEES ~${total_est_fees:.2f} | NET P@TP ${net_profit_tp:.2f} | "
     f"NET ACCT GAIN {net_acct_gain_tp:.2f}%"
 )
-if turbo_mode:
-    copy_text += " | MODE: TURBO LIGHT"
 
 st.code(copy_text, language="text")
 st.caption("Chromebook tip: tap-and-hold or drag-select to copy. Desktop: highlight + Ctrl/Cmd+C.")
