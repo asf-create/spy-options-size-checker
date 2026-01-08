@@ -451,7 +451,7 @@ st.markdown('<div class="card">', unsafe_allow_html=True)
 s1, s2 = st.columns(2)
 with s1:
     st.metric("Contracts", res["contracts"])
-    st.metric("Position Cost", f'${{res["pos_cost"]:.2f}')
+    st.metric("Position Cost", f'${res["pos_cost"]:.2f}')
 with s2:
     st.metric("Deploy % (auto)", f'{res["inv_pct"]:.1f}%')
     st.metric("Risk % (auto)", f'{res["rsk_pct"]:.1f}%')
@@ -469,8 +469,8 @@ st.write("")
 st.subheader("Exit Levels")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 e1, e2 = st.columns(2)
-e1.metric("TP Price", f'${{res["tp_price"]:.2f}')
-e2.metric("SL Price", f'${{res["sl_price"]:.2f}')
+e1.metric("TP Price", f'${res["tp_price"]:.2f}')
+e2.metric("SL Price", f'${res["sl_price"]:.2f}')
 st.caption(
     f"SL % used: {res['sl_pct']:.1f}% • Effective TP % on premium: {res['tp_pct_effective']:.2f}%"
 )
@@ -482,8 +482,8 @@ st.write("")
 st.subheader("P&L at TP/SL")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 p1, p2 = st.columns(2)
-p1.metric("Profit at TP (gross)", f'${{res["profit_tp_gross"]:.2f}')
-p2.metric("Loss at SL (gross)", f'${{res["loss_sl"]:.2f}')
+p1.metric("Profit at TP (gross)", f'${res["profit_tp_gross"]:.2f}')
+p2.metric("Loss at SL (gross)", f'${res["loss_sl"]:.2f}')
 
 st.caption(
     f"Gross account impact → TP: {res['acct_gain_tp_gross']:.2f}% • "
