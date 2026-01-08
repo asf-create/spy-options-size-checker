@@ -317,7 +317,7 @@ def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
 
 st.set_page_config(page_title="SPY Options Size Checker", layout="wide")
 
-theme_dark = st.toggle("🌗 Dark mode", value=True)
+theme_dark = st.toggle("🌗 Dark mode", value=False)
 
 if theme_dark:
     bg = "#0b0f19"
