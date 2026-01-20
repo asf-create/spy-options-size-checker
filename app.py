@@ -5,7 +5,7 @@ import streamlit as st
 # CONFIG
 # ----------------------------
 
-MIN_TICK = 0.01  # SPY options tick size (most contracts trade in $0.01 increments)
+MIN_TICK = 0.01  # SPY options tick size (usually $0.01 on many strikes)
 
 # As account grows, % deployed per main trade shrinks.
 INVEST_TIERS = [
@@ -24,8 +24,8 @@ RISK_TIERS = [
 ]
 
 # Base SL on option premium
-SL_TRADE1_BASE = 30.0          # Trade 1 SL% on premium
-SL_TRADE2_BASE = 24.0          # Starting SL% for trade 2 before tightening
+SL_TRADE1_BASE = 30.0  # Trade 1 SL% on premium
+SL_TRADE2_BASE = 24.0  # Trade 2 SL% before tightening
 
 # Trade 2: tighter SL for cheaper contracts
 TRADE2_TIGHTENING_RULES = [
@@ -37,39 +37,28 @@ TRADE2_TIGHTENING_RULES = [
 SL_TRADE2_MIN = 15.0
 SL_TRADE2_MAX = 26.0
 
-# Target account-gain guidance (NET-of-fees target range)
+# Target account-gain guidance (net of fees)
 MIN_GOAL_ACCT_GAIN = 0.20
 MAX_GOAL_ACCT_GAIN = 1.00
-
 
 # ----------------------------
 # HELPERS
 # ----------------------------
 
 def tier_lookup(value, tiers):
-    """Return percentage for the first tier where value <= max_val."""
     for max_val, pct in tiers:
         if value <= max_val:
             return pct
     return tiers[-1][1]
 
-
 def invest_percent(balance, trade_number):
-    """
-    Trade #1 gets full deploy %.
-    Trade #2 gets half deploy %.
-    """
     base = tier_lookup(balance, INVEST_TIERS)
     return base if trade_number == 1 else base / 2.0
 
-
 def base_risk_percent(balance):
-    """Base risk% from tiers (before trade-2 reduction)."""
     return tier_lookup(balance, RISK_TIERS)
 
-
 def trade2_dynamic_sl(entry_price):
-    """Tighten SL% for trade #2 based on option price."""
     extra = 0.0
     for upper, tighten in TRADE2_TIGHTENING_RULES:
         if entry_price <= upper:
@@ -78,43 +67,48 @@ def trade2_dynamic_sl(entry_price):
     sl = SL_TRADE2_BASE - extra
     return max(SL_TRADE2_MIN, min(SL_TRADE2_MAX, sl))
 
+def round_to_tick(price, tick=MIN_TICK):
+    # Round to nearest cent
+    return round(price / tick) * tick
 
-def compute_tp_percent_for_target_account_gain(
+def compute_tp_price_with_cap(entry_price, tp_cap_pct):
+    """
+    Convert a TP cap (on premium %) into a TP price.
+    Ensures TP is at least +1 tick above entry.
+    """
+    tp_price_unrounded = entry_price * (1.0 + tp_cap_pct / 100.0)
+    tp_price = round(tp_price_unrounded, 2)
+    if tp_price <= entry_price:
+        tp_price = round(entry_price + MIN_TICK, 2)
+    return tp_price
+
+def effective_tp_pct(entry_price, tp_price):
+    if entry_price <= 0:
+        return 0.0
+    return ((tp_price / entry_price) - 1.0) * 100.0
+
+def compute_tp_percent_for_target_account_gain_net(
     balance,
     entry_price,
     contracts,
-    target_account_gain_pct,
+    target_account_gain_pct_net,
     fee_round_trip_per_contract,
 ):
     """
-    Given a desired NET account % gain for the trade, compute needed TP% on the option premium.
-
-    fee_round_trip_per_contract is the estimated total fees for one contract for the full trade:
-    buy + sell combined (round-trip).
+    Compute TP% on premium needed so that NET account gain (after fees) hits target.
     """
     if contracts <= 0 or balance <= 0 or entry_price <= 0:
         return None
 
-    # Target net profit in dollars (after fees)
-    profit_goal_net = balance * (target_account_gain_pct / 100.0)
-
-    # Estimated round-trip fees for position (already includes buy+sell)
-    total_fees_est = fee_round_trip_per_contract * contracts
-
-    # Need this much gross profit on the option to hit the net goal
-    profit_goal_gross = profit_goal_net + total_fees_est
+    profit_goal_net = balance * (target_account_gain_pct_net / 100.0)
+    total_fees = fee_round_trip_per_contract * contracts
+    profit_goal_gross = profit_goal_net + total_fees
 
     denom = entry_price * 100.0 * contracts
     if denom <= 0:
         return None
 
     return (profit_goal_gross / denom) * 100.0
-
-
-def round_to_tick(x, tick=MIN_TICK):
-    """Round price to nearest tick (default $0.01)."""
-    return round(round(x / tick) * tick, 2)
-
 
 # ----------------------------
 # CORE CALC
@@ -124,20 +118,17 @@ def calc(
     balance,
     entry_price,
     trade_number,
-    target_gain_pct,
+    target_gain_pct_net,
     fee_round_trip_per_contract,
-    max_tp_premium_pct,
+    tp_cap_pct,
 ):
     """
-    Core sizing + TP/SL math.
-
-    All account impact percentages are based on ACCOUNT balance, not contract size.
-
-    We search all valid contract counts and pick the one whose NET account gain (after fees)
-    is closest to target_gain_pct, subject to:
-      - TP% on premium <= max_tp_premium_pct (cap)
+    Picks contract count + TP such that:
+      - Uses deploy + risk budgets
+      - Targets NET account gain (after fees)
+      - TP premium move does NOT exceed tp_cap_pct (effective)
+    If impossible, returns max achievable NET gain under the TP cap.
     """
-
     inv_pct = invest_percent(balance, trade_number)
     rsk_pct_base = base_risk_percent(balance)
 
@@ -147,245 +138,182 @@ def calc(
     inv_budget = balance * inv_pct / 100.0
     rsk_budget = balance * rsk_pct / 100.0
 
-    # SL% used for actual P&L
-    if trade_number == 1:
-        sl_pct = SL_TRADE1_BASE
-    else:
-        sl_pct = trade2_dynamic_sl(entry_price)
+    # SL% used for actual P&L display
+    sl_pct = SL_TRADE1_BASE if trade_number == 1 else trade2_dynamic_sl(entry_price)
 
     cost_per_contract = entry_price * 100.0
-
-    # Actual SL price & per-contract loss
     sl_price = entry_price * (1.0 - sl_pct / 100.0)
     loss_per_contract_actual = (entry_price - sl_price) * 100.0
 
-    # ---- RISK LIMIT: do NOT let tighter SL on trade 2 increase size ----
-    if trade_number == 1:
-        sl_pct_risk = sl_pct
-    else:
-        # For risk budgeting, pretend trade 2 has Trade 1 SL%,
-        # so trade 2 cannot be larger just because its SL is tighter.
-        sl_pct_risk = SL_TRADE1_BASE
-
+    # Risk sizing should not allow trade2 to get larger just because SL is tighter
+    sl_pct_risk = SL_TRADE1_BASE  # use trade1 SL for risk sizing for both trades
     sl_price_risk = entry_price * (1.0 - sl_pct_risk / 100.0)
     loss_per_contract_risk = (entry_price - sl_price_risk) * 100.0
-    # --------------------------------------------------------------------
 
-    # Contract limits from deploy & risk budgets
     max_by_invest = math.floor(inv_budget / cost_per_contract) if cost_per_contract > 0 else 0
     max_by_risk = math.floor(rsk_budget / loss_per_contract_risk) if loss_per_contract_risk > 0 else 0
     max_contracts = max(0, min(max_by_invest, max_by_risk))
 
-    # If nothing fits, return a "zero" plan
-    if max_contracts == 0:
-        return {
-            "contracts": 0,
-            "inv_pct": inv_pct,
-            "rsk_pct": rsk_pct,
-            "sl_pct": sl_pct,
-            "tp_pct_effective": 0.0,
-            "pos_cost": 0.0,
-            "tp_price": entry_price,
-            "sl_price": sl_price,
-            "profit_tp_gross": 0.0,
-            "loss_sl": 0.0,
-            "total_fees_est": 0.0,
-            "net_profit_tp": 0.0,
-            "acct_gain_tp_gross": 0.0,
-            "acct_loss_sl_gross": 0.0,
-            "acct_gain_tp_net": 0.0,
-            "max_by_invest": max_by_invest,
-            "max_by_risk": max_by_risk,
-            "inv_budget": inv_budget,
-            "rsk_budget": rsk_budget,
-            "cost_per_contract": cost_per_contract,
-            "note": "No contracts fit deploy/risk limits at this entry price.",
-        }
+    base = {
+        "contracts": 0,
+        "inv_pct": inv_pct,
+        "rsk_pct": rsk_pct,
+        "inv_budget": inv_budget,
+        "rsk_budget": rsk_budget,
+        "sl_pct": sl_pct,
+        "sl_price": sl_price,
+        "cost_per_contract": cost_per_contract,
+        "max_by_invest": max_by_invest,
+        "max_by_risk": max_by_risk,
+        "tp_cap_pct": tp_cap_pct,
+        "feasible": False,
+        "note": "",
+        "tp_price": entry_price,
+        "tp_pct_effective": 0.0,
+        "pos_cost": 0.0,
+        "profit_tp_gross": 0.0,
+        "total_fees": 0.0,
+        "net_profit_tp": 0.0,
+        "acct_gain_tp_net": 0.0,
+        "acct_gain_tp_gross": 0.0,
+        "loss_sl": 0.0,
+        "acct_loss_sl_gross": 0.0,
+        "max_net_gain_possible": 0.0,
+    }
 
+    if max_contracts <= 0:
+        base["note"] = "No contracts fit your deploy/risk rules at this entry price."
+        return base
+
+    # We search all n=1..max_contracts and choose the closest NET account gain to target
+    # while enforcing effective TP% <= tp_cap_pct.
     best = None
-    feasible_found = False
-
     for n in range(1, max_contracts + 1):
-        tp_pct_raw = compute_tp_percent_for_target_account_gain(
+        # raw tp% needed to hit the NET account goal
+        tp_pct_raw = compute_tp_percent_for_target_account_gain_net(
             balance=balance,
             entry_price=entry_price,
             contracts=n,
-            target_account_gain_pct=target_gain_pct,
+            target_account_gain_pct_net=target_gain_pct_net,
             fee_round_trip_per_contract=fee_round_trip_per_contract,
         )
         if tp_pct_raw is None:
             continue
 
-        # Ideal TP price from tp_pct_raw
+        # convert to TP price (rounded)
         tp_price_unrounded = entry_price * (1.0 + tp_pct_raw / 100.0)
-        tp_price = round_to_tick(tp_price_unrounded, MIN_TICK)
-
-        # Ensure TP > entry. Only then bump 1 tick.
+        tp_price = round(tp_price_unrounded, 2)
         if tp_price <= entry_price:
-            tp_price = round_to_tick(entry_price + MIN_TICK, MIN_TICK)
+            tp_price = round(entry_price + MIN_TICK, 2)
 
-        # Effective TP% after rounding
-        tp_pct_effective = ((tp_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
+        tp_pct_eff = effective_tp_pct(entry_price, tp_price)
 
-        # Enforce premium TP% cap (your new rule)
-        if tp_pct_effective > max_tp_premium_pct + 1e-9:
+        # Enforce TP cap on premium move
+        if tp_pct_eff > tp_cap_pct + 1e-9:
             continue
 
-        feasible_found = True
-
-        # Position-level P&L (gross)
         pos_cost = n * cost_per_contract
         profit_tp_gross = (tp_price - entry_price) * 100.0 * n
+        total_fees = fee_round_trip_per_contract * n
+        net_profit_tp = profit_tp_gross - total_fees
+
         loss_sl = loss_per_contract_actual * n
 
-        # Fees (round-trip) - already includes buy+sell
-        total_fees_est = fee_round_trip_per_contract * n
-
-        # Net profit after fees
-        net_profit_tp = profit_tp_gross - total_fees_est
-
-        # Account-level impact
         acct_gain_tp_gross = (profit_tp_gross / balance * 100.0) if balance > 0 else 0.0
-        acct_loss_sl_gross = (loss_sl / balance * 100.0) if balance > 0 else 0.0
         acct_gain_tp_net = (net_profit_tp / balance * 100.0) if balance > 0 else 0.0
+        acct_loss_sl_gross = (loss_sl / balance * 100.0) if balance > 0 else 0.0
 
-        diff = abs(acct_gain_tp_net - target_gain_pct)
+        diff = abs(acct_gain_tp_net - target_gain_pct_net)
 
-        candidate = {
+        candidate = dict(base)
+        candidate.update({
             "contracts": n,
-            "inv_pct": inv_pct,
-            "rsk_pct": rsk_pct,
-            "sl_pct": sl_pct,
-            "tp_pct_effective": tp_pct_effective,
-            "pos_cost": pos_cost,
             "tp_price": tp_price,
-            "sl_price": sl_price,
+            "tp_pct_effective": tp_pct_eff,
+            "pos_cost": pos_cost,
             "profit_tp_gross": profit_tp_gross,
-            "loss_sl": loss_sl,
-            "total_fees_est": total_fees_est,
+            "total_fees": total_fees,
             "net_profit_tp": net_profit_tp,
             "acct_gain_tp_gross": acct_gain_tp_gross,
-            "acct_loss_sl_gross": acct_loss_sl_gross,
             "acct_gain_tp_net": acct_gain_tp_net,
-            "max_by_invest": max_by_invest,
-            "max_by_risk": max_by_risk,
-            "inv_budget": inv_budget,
-            "rsk_budget": rsk_budget,
-            "cost_per_contract": cost_per_contract,
-            "diff_from_target": diff,
-        }
+            "loss_sl": loss_sl,
+            "acct_loss_sl_gross": acct_loss_sl_gross,
+            "feasible": True,
+            "_diff": diff,
+        })
 
-        if best is None or diff < best["diff_from_target"]:
+        # Tie-breakers:
+        # - Prefer closest diff
+        # - If very close diff, prefer smaller size on trade2, larger size on trade1
+        if best is None:
             best = candidate
+        else:
+            if candidate["_diff"] < best["_diff"] - 1e-9:
+                best = candidate
+            else:
+                # If nearly same diff, apply tie-breaker by trade type
+                if abs(candidate["_diff"] - best["_diff"]) <= 0.02:
+                    if trade_number == 1 and candidate["contracts"] > best["contracts"]:
+                        best = candidate
+                    if trade_number == 2 and candidate["contracts"] < best["contracts"]:
+                        best = candidate
 
-    if best is None:
-        note = (
-            "Could not find a plan that meets the TP cap. "
-            "Try lowering the target account gain, choosing a different (cheaper) contract, "
-            "or increasing max TP cap slightly."
-        )
-        if not feasible_found:
-            note = (
-                "No contract count can reach the target within your TP cap. "
-                "Lower target account gain or use a contract that moves more per $0.01."
-            )
+    if best is not None:
+        best.pop("_diff", None)
+        return best
 
-        return {
-            "contracts": 0,
-            "inv_pct": inv_pct,
-            "rsk_pct": rsk_pct,
-            "sl_pct": sl_pct,
-            "tp_pct_effective": 0.0,
-            "pos_cost": 0.0,
-            "tp_price": entry_price,
-            "sl_price": entry_price * (1.0 - sl_pct / 100.0),
-            "profit_tp_gross": 0.0,
-            "loss_sl": 0.0,
-            "total_fees_est": 0.0,
-            "net_profit_tp": 0.0,
-            "acct_gain_tp_gross": 0.0,
-            "acct_loss_sl_gross": 0.0,
-            "acct_gain_tp_net": 0.0,
-            "max_by_invest": max_by_invest,
-            "max_by_risk": max_by_risk,
-            "inv_budget": inv_budget,
-            "rsk_budget": rsk_budget,
-            "cost_per_contract": cost_per_contract,
-            "note": note,
-        }
+    # If we get here, it means the target NET account gain is impossible under tp_cap_pct.
+    # Compute maximum possible NET account gain using max_contracts and TP at the cap.
+    n = max_contracts
+    tp_price_cap = compute_tp_price_with_cap(entry_price, tp_cap_pct)
+    tp_pct_eff_cap = effective_tp_pct(entry_price, tp_price_cap)
 
-    best.pop("diff_from_target", None)
-    best["note"] = ""
-    return best
+    pos_cost = n * cost_per_contract
+    profit_tp_gross = (tp_price_cap - entry_price) * 100.0 * n
+    total_fees = fee_round_trip_per_contract * n
+    net_profit_tp = profit_tp_gross - total_fees
 
+    loss_sl = loss_per_contract_actual * n
+    acct_gain_tp_gross = (profit_tp_gross / balance * 100.0) if balance > 0 else 0.0
+    acct_gain_tp_net = (net_profit_tp / balance * 100.0) if balance > 0 else 0.0
+    acct_loss_sl_gross = (loss_sl / balance * 100.0) if balance > 0 else 0.0
+
+    base.update({
+        "contracts": n,
+        "tp_price": tp_price_cap,
+        "tp_pct_effective": tp_pct_eff_cap,
+        "pos_cost": pos_cost,
+        "profit_tp_gross": profit_tp_gross,
+        "total_fees": total_fees,
+        "net_profit_tp": net_profit_tp,
+        "acct_gain_tp_gross": acct_gain_tp_gross,
+        "acct_gain_tp_net": acct_gain_tp_net,
+        "loss_sl": loss_sl,
+        "acct_loss_sl_gross": acct_loss_sl_gross,
+        "max_net_gain_possible": acct_gain_tp_net,
+        "feasible": False,
+        "note": (
+            f"Not feasible to reach {target_gain_pct_net:.2f}% NET with a {tp_cap_pct:.1f}% contract TP cap "
+            f"under your deploy/risk limits. Max achievable NET is ~{acct_gain_tp_net:.2f}%."
+        ),
+    })
+    return base
 
 # ----------------------------
-# UI
+# UI (simple, minimalist)
 # ----------------------------
 
-st.set_page_config(page_title="SPY Options Size Checker", layout="wide")
-
-theme_dark = st.toggle("🌗 Dark mode", value=False)
-
-if theme_dark:
-    bg = "#0b0f19"
-    card = "#101624"
-    border = "rgba(255,255,255,0.12)"
-    text = "rgba(255,255,255,0.96)"
-    subtle = "rgba(255,255,255,0.72)"
-    accent_bg = "rgba(34,197,94,0.12)"   # green-ish info box
-    accent_border = "rgba(34,197,94,0.30)"
-else:
-    bg = "#ffffff"
-    card = "#f5f5f7"
-    border = "rgba(0,0,0,0.10)"
-    text = "rgba(0,0,0,0.90)"
-    subtle = "rgba(0,0,0,0.65)"
-    accent_bg = "rgba(34,197,94,0.10)"
-    accent_border = "rgba(34,197,94,0.25)"
+st.set_page_config(page_title="SPY Options Size Checker", layout="centered")
 
 st.markdown(
-    f"""
+    """
 <style>
-html, body, [class*="css"] {{
-  background-color: {bg};
-  color: {text};
-}}
-.block-container {{
-  max-width: 980px;
-  padding-top: 1.6rem;
-  padding-bottom: 2.2rem;
-}}
-.card {{
-  border: 1px solid {border};
-  border-radius: 16px;
-  padding: 16px 18px;
-  background: {card};
-}}
-.small {{
-  color: {subtle};
-  font-size: 0.95rem;
-  line-height: 1.35rem;
-}}
-.accent {{
-  border: 1px solid {accent_border};
-  background: {accent_bg};
-}}
-button[kind="primary"], button[kind="secondary"] {{
-  border-radius: 12px !important;
-}}
-[data-testid="stMetricValue"] {{
-  font-size: 1.35rem;
-}}
-@media (max-width: 700px) {{
-  .block-container {{
-    padding-left: 0.9rem;
-    padding-right: 0.9rem;
-  }}
-  [data-testid="stMetricValue"] {{
-    font-size: 1.15rem;
-  }}
-}}
+:root { --card:#0f172a10; --border:#0000001a; --text:#0b1220; --muted:#556070; }
+html, body, [class*="css"] { background:#ffffff; color:var(--text); }
+.block-container { max-width: 860px; padding-top: 1.4rem; padding-bottom: 2rem; }
+.card { border:1px solid var(--border); background:#ffffff; border-radius:16px; padding:16px 18px; }
+.small { color:var(--muted); font-size:0.95rem; line-height:1.35rem; }
+hr { border:none; border-top:1px solid var(--border); margin:16px 0; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -394,160 +322,116 @@ button[kind="primary"], button[kind="secondary"] {{
 st.title("SPY Options Size Checker")
 
 st.markdown(
-    '<div class="card accent small">'
-    "<b>Goal:</b> hit a small NET account gain per trade (after estimated fees), "
-    "while keeping the <b>option premium TP% capped</b> so you’re not relying on big contract moves."
-    "<br><br>"
-    "<b>Trade 1</b>: full deploy & risk tiers. "
-    "<b>Trade 2</b>: half deploy, half risk budget, tighter SL — and cannot size bigger than Trade 1."
-    "</div>",
+    """
+<div class="card small">
+<b>Goal:</b> size trades to hit a <b>NET account gain</b> target (after fees) while keeping risk controlled.<br>
+<b>Important:</b> If you cap the contract move (ex: 3–8%), the target may be impossible when deploy/risk limits prevent buying enough contracts.
+The app will show the <b>max achievable</b> net gain when that happens.
+</div>
+""",
     unsafe_allow_html=True,
 )
 
 st.write("")
 
 # Inputs
-c1, c2 = st.columns(2)
-with c1:
-    balance = st.number_input(
-        "Account balance ($)",
-        min_value=0.0,
-        value=467.0,
-        step=10.0,
-    )
-with c2:
+r1c1, r1c2 = st.columns(2)
+with r1c1:
+    balance = st.number_input("Account balance ($)", min_value=0.0, value=1500.0, step=50.0)
+with r1c2:
     trade_number = st.radio("Trade of the week", [1, 2], horizontal=True)
-st.caption("1 = main trade • 2 = secondary trade (half deploy + half risk).")
 
-c3, c4 = st.columns(2)
-with c3:
-    entry_price = st.number_input(
-        "Entry price (option premium)",
-        min_value=0.01,
-        value=0.25,
-        step=0.01,
-        format="%.2f",
-    )
-with c4:
-    fee_round_trip_per_contract = st.number_input(
-        "Estimated fees per contract ($, round trip)",
+st.caption("Trade 2 automatically uses half deploy and half risk budget (so it stays smaller).")
+
+r2c1, r2c2 = st.columns(2)
+with r2c1:
+    entry_price = st.number_input("Entry price (option premium)", min_value=0.01, value=0.25, step=0.01, format="%.2f")
+with r2c2:
+    fee_round_trip = st.number_input(
+        "Estimated fees per contract (round trip, $)",
         min_value=0.00,
-        value=0.08,
+        value=0.04,
         step=0.01,
         format="%.2f",
-        help="Total estimated fees for ONE contract for the whole trade (buy + sell combined).",
+        help="Total estimated fees for one contract including BUY + SELL combined.",
     )
 
-st.write("")
-
-c5, c6 = st.columns(2)
-with c5:
+r3c1, r3c2 = st.columns(2)
+with r3c1:
+    tp_cap_pct = st.selectbox("Max contract TP % (premium move cap)", [3.0, 4.0, 8.0], index=2)
+with r3c2:
+    default_target = 0.80 if trade_number == 1 else 0.40
     target_gain_pct = st.slider(
-        "Target NET gain on TOTAL account (%)",
+        "Target NET account gain (%)",
         min_value=MIN_GOAL_ACCT_GAIN,
         max_value=MAX_GOAL_ACCT_GAIN,
-        value=0.80,
+        value=default_target,
         step=0.01,
-        help="This is NET-of-fees target. Sizing is based on ACCOUNT % gain, not contract %.",
-    )
-with c6:
-    max_tp_premium_pct = st.slider(
-        "Max TP on option premium (%)",
-        min_value=1.0,
-        max_value=20.0,
-        value=8.0,
-        step=0.5,
-        help="Your rule: the contract TP% should not need to exceed this value.",
     )
 
-# Core calculations
 res = calc(
     balance=balance,
     entry_price=entry_price,
     trade_number=trade_number,
-    target_gain_pct=target_gain_pct,
-    fee_round_trip_per_contract=fee_round_trip_per_contract,
-    max_tp_premium_pct=max_tp_premium_pct,
+    target_gain_pct_net=target_gain_pct,
+    fee_round_trip_per_contract=fee_round_trip,
+    tp_cap_pct=tp_cap_pct,
 )
 
-# Summary card
+st.write("")
 st.markdown('<div class="card">', unsafe_allow_html=True)
-s1, s2 = st.columns(2)
-with s1:
-    st.metric("Contracts", res["contracts"])
-    st.metric("Position Cost", f'${res["pos_cost"]:.2f}')
-with s2:
-    st.metric("Deploy % (auto)", f'{res["inv_pct"]:.1f}%')
-    st.metric("Risk % (auto)", f'{res["rsk_pct"]:.1f}%')
+m1, m2, m3 = st.columns(3)
+m1.metric("Contracts", res["contracts"])
+m2.metric("Position Cost", f'${res["pos_cost"]:.2f}')
+m3.metric("TP Cap", f"{tp_cap_pct:.1f}%")
 st.markdown("</div>", unsafe_allow_html=True)
 
 if res["contracts"] == 0:
-    msg = res.get("note", "") or (
-        "Under your deploy/risk rules, this entry price is too expensive for any contracts "
-        "(contracts = 0). Consider a cheaper strike or smaller premium."
-    )
-    st.warning(msg)
+    st.warning("No contracts fit your deploy/risk limits at this entry price. Try a cheaper contract or lower entry.")
+elif not res["feasible"]:
+    st.warning(res["note"])
 
 st.write("")
-
-# Exit levels
 st.subheader("Exit Levels")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 e1, e2 = st.columns(2)
 e1.metric("TP Price", f'${res["tp_price"]:.2f}')
 e2.metric("SL Price", f'${res["sl_price"]:.2f}')
-st.caption(
-    f"SL % used: {res['sl_pct']:.1f}% • Effective TP % on premium: {res['tp_pct_effective']:.2f}% "
-    f"(cap: {max_tp_premium_pct:.1f}%)"
-)
+st.caption(f"SL % used: {res['sl_pct']:.1f}% • Effective TP % on premium: {res['tp_pct_effective']:.2f}%")
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.write("")
-
-# P&L card
-st.subheader("P&L at TP/SL")
+st.subheader("P&L (TP/SL)")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 p1, p2 = st.columns(2)
-p1.metric("Profit at TP (gross)", f'${res["profit_tp_gross"]:.2f}')
+p1.metric("Net profit at TP", f'${res["net_profit_tp"]:.2f}')
 p2.metric("Loss at SL (gross)", f'${res["loss_sl"]:.2f}')
-
 st.caption(
-    f"Gross account impact → TP: {res['acct_gain_tp_gross']:.2f}% • "
-    f"SL: {res['acct_loss_sl_gross']:.2f}% (based on ACCOUNT balance)."
+    f"Account impact → NET TP: {res['acct_gain_tp_net']:.2f}% • "
+    f"GROSS TP: {res['acct_gain_tp_gross']:.2f}% • "
+    f"GROSS SL: {res['acct_loss_sl_gross']:.2f}%"
 )
-st.caption(
-    f"Estimated total fees: ${res['total_fees_est']:.2f}  |  "
-    f"Net profit at TP (after est. fees): ${res['net_profit_tp']:.2f}  |  "
-    f"Net account gain at TP (after est. fees): {res['acct_gain_tp_net']:.2f}%"
-)
+st.caption(f"Estimated total fees (position): ${res['total_fees']:.2f}")
+if not res["feasible"] and res["contracts"] > 0:
+    st.caption(f"Max achievable NET under cap: ~{res['max_net_gain_possible']:.2f}%")
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.write("")
-
-# Budgets & limits
 st.subheader("Budgets & Limits")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.write(f"Deploy budget: **${res['inv_budget']:.2f}** • Risk budget: **${res['rsk_budget']:.2f}**")
 st.write(f"Cost/contract: **${res['cost_per_contract']:.2f}**")
-st.write(
-    f"Max contracts by deploy: **{res['max_by_invest']}** • "
-    f"Max contracts by risk: **{res['max_by_risk']}**"
-)
+st.write(f"Max contracts by deploy: **{res['max_by_invest']}** • Max contracts by risk: **{res['max_by_risk']}**")
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.write("")
-
-# Copy-ready block
 st.subheader("Copy-ready plan")
 copy_text = (
     f"ENTRY ${entry_price:.2f} | CONTRACTS {res['contracts']} | "
-    f"TP ${res['tp_price']:.2f} | SL ${res['sl_price']:.2f} | "
-    f"POS COST ${res['pos_cost']:.2f} | "
-    f"P@TP (gross) ${res['profit_tp_gross']:.2f} | "
-    f"L@SL (gross) ${res['loss_sl']:.2f} | "
-    f"FEES (est) ${res['total_fees_est']:.2f} | "
-    f"NET P@TP ${res['net_profit_tp']:.2f} | "
-    f"NET ACCT GAIN {res['acct_gain_tp_net']:.2f}%"
+    f"TP ${res['tp_price']:.2f} (cap {tp_cap_pct:.1f}%) | "
+    f"SL ${res['sl_price']:.2f} | "
+    f"NET ACCT GAIN @TP {res['acct_gain_tp_net']:.2f}% | "
+    f"NET P@TP ${res['net_profit_tp']:.2f} | FEES ${res['total_fees']:.2f}"
 )
 st.code(copy_text, language="text")
 st.caption("Not financial advice. Tool is for position sizing / risk math only.")
