@@ -5,7 +5,7 @@ import streamlit as st
 # CONFIG
 # ----------------------------
 
-MIN_TICK = 0.01  # SPY options tick size
+MIN_TICK = 0.01  # SPY options tick size (most contracts trade in $0.01 increments)
 
 # As account grows, % deployed per main trade shrinks.
 INVEST_TIERS = [
@@ -37,7 +37,7 @@ TRADE2_TIGHTENING_RULES = [
 SL_TRADE2_MIN = 15.0
 SL_TRADE2_MAX = 26.0
 
-# Target account-gain guidance
+# Target account-gain guidance (NET-of-fees target range)
 MIN_GOAL_ACCT_GAIN = 0.20
 MAX_GOAL_ACCT_GAIN = 1.00
 
@@ -84,12 +84,13 @@ def compute_tp_percent_for_target_account_gain(
     entry_price,
     contracts,
     target_account_gain_pct,
-    fee_per_contract,
+    fee_round_trip_per_contract,
 ):
     """
     Given a desired NET account % gain for the trade, compute needed TP% on the option premium.
-    We gross up by estimated round-trip fees so the NET gain is as close as possible
-    to the requested percentage.
+
+    fee_round_trip_per_contract is the estimated total fees for one contract for the full trade:
+    buy + sell combined (round-trip).
     """
     if contracts <= 0 or balance <= 0 or entry_price <= 0:
         return None
@@ -97,8 +98,8 @@ def compute_tp_percent_for_target_account_gain(
     # Target net profit in dollars (after fees)
     profit_goal_net = balance * (target_account_gain_pct / 100.0)
 
-    # Estimated round-trip fees (buy + sell)
-    total_fees_est = fee_per_contract * contracts * 2.0
+    # Estimated round-trip fees for position (already includes buy+sell)
+    total_fees_est = fee_round_trip_per_contract * contracts
 
     # Need this much gross profit on the option to hit the net goal
     profit_goal_gross = profit_goal_net + total_fees_est
@@ -110,29 +111,38 @@ def compute_tp_percent_for_target_account_gain(
     return (profit_goal_gross / denom) * 100.0
 
 
+def round_to_tick(x, tick=MIN_TICK):
+    """Round price to nearest tick (default $0.01)."""
+    return round(round(x / tick) * tick, 2)
+
+
 # ----------------------------
 # CORE CALC
 # ----------------------------
 
-
-def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
+def calc(
+    balance,
+    entry_price,
+    trade_number,
+    target_gain_pct,
+    fee_round_trip_per_contract,
+    max_tp_premium_pct,
+):
     """
     Core sizing + TP/SL math.
 
     All account impact percentages are based on ACCOUNT balance, not contract size.
 
-    Instead of always using the maximum contracts, we search all valid contract counts
-    and pick the one whose NET account gain (after fees) is closest to target_gain_pct.
+    We search all valid contract counts and pick the one whose NET account gain (after fees)
+    is closest to target_gain_pct, subject to:
+      - TP% on premium <= max_tp_premium_pct (cap)
     """
 
     inv_pct = invest_percent(balance, trade_number)
     rsk_pct_base = base_risk_percent(balance)
 
     # Trade #2 uses half risk budget as well as half deploy
-    if trade_number == 1:
-        rsk_pct = rsk_pct_base
-    else:
-        rsk_pct = rsk_pct_base / 2.0
+    rsk_pct = rsk_pct_base if trade_number == 1 else rsk_pct_base / 2.0
 
     inv_budget = balance * inv_pct / 100.0
     rsk_budget = balance * rsk_pct / 100.0
@@ -153,8 +163,8 @@ def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
     if trade_number == 1:
         sl_pct_risk = sl_pct
     else:
-        # For risk budgeting we pretend trade 2 has the same SL% as trade 1,
-        # so trade 2 cannot be larger just because the SL is tighter.
+        # For risk budgeting, pretend trade 2 has Trade 1 SL%,
+        # so trade 2 cannot be larger just because its SL is tighter.
         sl_pct_risk = SL_TRADE1_BASE
 
     sl_price_risk = entry_price * (1.0 - sl_pct_risk / 100.0)
@@ -162,16 +172,8 @@ def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
     # --------------------------------------------------------------------
 
     # Contract limits from deploy & risk budgets
-    if cost_per_contract > 0:
-        max_by_invest = math.floor(inv_budget / cost_per_contract)
-    else:
-        max_by_invest = 0
-
-    if loss_per_contract_risk > 0:
-        max_by_risk = math.floor(rsk_budget / loss_per_contract_risk)
-    else:
-        max_by_risk = 0
-
+    max_by_invest = math.floor(inv_budget / cost_per_contract) if cost_per_contract > 0 else 0
+    max_by_risk = math.floor(rsk_budget / loss_per_contract_risk) if loss_per_contract_risk > 0 else 0
     max_contracts = max(0, min(max_by_invest, max_by_risk))
 
     # If nothing fits, return a "zero" plan
@@ -197,61 +199,56 @@ def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
             "inv_budget": inv_budget,
             "rsk_budget": rsk_budget,
             "cost_per_contract": cost_per_contract,
+            "note": "No contracts fit deploy/risk limits at this entry price.",
         }
 
-    # SEARCH over all possible contract counts (1..max_contracts)
     best = None
+    feasible_found = False
 
     for n in range(1, max_contracts + 1):
-        # 1) what TP% on premium is needed (before rounding)?
         tp_pct_raw = compute_tp_percent_for_target_account_gain(
-            balance,
-            entry_price,
-            n,
-            target_gain_pct,
-            fee_per_contract,
+            balance=balance,
+            entry_price=entry_price,
+            contracts=n,
+            target_account_gain_pct=target_gain_pct,
+            fee_round_trip_per_contract=fee_round_trip_per_contract,
         )
         if tp_pct_raw is None:
             continue
 
-        # 2) ideal (unrounded) TP price
+        # Ideal TP price from tp_pct_raw
         tp_price_unrounded = entry_price * (1.0 + tp_pct_raw / 100.0)
+        tp_price = round_to_tick(tp_price_unrounded, MIN_TICK)
 
-        # 3) round to nearest cent
-        tp_price = round(tp_price_unrounded, 2)
-
-        # 4) ensure TP > entry, otherwise bump by one tick
+        # Ensure TP > entry. Only then bump 1 tick.
         if tp_price <= entry_price:
-            tp_price = round(entry_price + MIN_TICK, 2)
+            tp_price = round_to_tick(entry_price + MIN_TICK, MIN_TICK)
 
-        # 5) effective TP% after rounding
-        if entry_price > 0:
-            tp_pct_effective = ((tp_price / entry_price) - 1.0) * 100.0
-        else:
-            tp_pct_effective = 0.0
+        # Effective TP% after rounding
+        tp_pct_effective = ((tp_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
 
-        # 6) position-level P&L (gross)
+        # Enforce premium TP% cap (your new rule)
+        if tp_pct_effective > max_tp_premium_pct + 1e-9:
+            continue
+
+        feasible_found = True
+
+        # Position-level P&L (gross)
         pos_cost = n * cost_per_contract
         profit_tp_gross = (tp_price - entry_price) * 100.0 * n
         loss_sl = loss_per_contract_actual * n
 
-        # 7) fees (round-trip)
-        total_fees_est = fee_per_contract * n * 2.0
+        # Fees (round-trip) - already includes buy+sell
+        total_fees_est = fee_round_trip_per_contract * n
 
-        # 8) net profit after fees
+        # Net profit after fees
         net_profit_tp = profit_tp_gross - total_fees_est
 
-        # 9) account-level impact
-        if balance > 0:
-            acct_gain_tp_gross = profit_tp_gross / balance * 100.0
-            acct_loss_sl_gross = loss_sl / balance * 100.0
-            acct_gain_tp_net = net_profit_tp / balance * 100.0
-        else:
-            acct_gain_tp_gross = 0.0
-            acct_loss_sl_gross = 0.0
-            acct_gain_tp_net = 0.0
+        # Account-level impact
+        acct_gain_tp_gross = (profit_tp_gross / balance * 100.0) if balance > 0 else 0.0
+        acct_loss_sl_gross = (loss_sl / balance * 100.0) if balance > 0 else 0.0
+        acct_gain_tp_net = (net_profit_tp / balance * 100.0) if balance > 0 else 0.0
 
-        # 10) how close are we to target (NET account %)?
         diff = abs(acct_gain_tp_net - target_gain_pct)
 
         candidate = {
@@ -278,12 +275,21 @@ def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
             "diff_from_target": diff,
         }
 
-        # Keep the candidate closest to target_gain_pct (NET)
         if best is None or diff < best["diff_from_target"]:
             best = candidate
 
     if best is None:
-        # Shouldn't really happen, but safe fallback
+        note = (
+            "Could not find a plan that meets the TP cap. "
+            "Try lowering the target account gain, choosing a different (cheaper) contract, "
+            "or increasing max TP cap slightly."
+        )
+        if not feasible_found:
+            note = (
+                "No contract count can reach the target within your TP cap. "
+                "Lower target account gain or use a contract that moves more per $0.01."
+            )
+
         return {
             "contracts": 0,
             "inv_pct": inv_pct,
@@ -292,7 +298,7 @@ def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
             "tp_pct_effective": 0.0,
             "pos_cost": 0.0,
             "tp_price": entry_price,
-            "sl_price": sl_price,
+            "sl_price": entry_price * (1.0 - sl_pct / 100.0),
             "profit_tp_gross": 0.0,
             "loss_sl": 0.0,
             "total_fees_est": 0.0,
@@ -305,9 +311,11 @@ def calc(balance, entry_price, trade_number, target_gain_pct, fee_per_contract):
             "inv_budget": inv_budget,
             "rsk_budget": rsk_budget,
             "cost_per_contract": cost_per_contract,
+            "note": note,
         }
 
     best.pop("diff_from_target", None)
+    best["note"] = ""
     return best
 
 
@@ -325,12 +333,16 @@ if theme_dark:
     border = "rgba(255,255,255,0.12)"
     text = "rgba(255,255,255,0.96)"
     subtle = "rgba(255,255,255,0.72)"
+    accent_bg = "rgba(34,197,94,0.12)"   # green-ish info box
+    accent_border = "rgba(34,197,94,0.30)"
 else:
     bg = "#ffffff"
     card = "#f5f5f7"
     border = "rgba(0,0,0,0.10)"
     text = "rgba(0,0,0,0.90)"
     subtle = "rgba(0,0,0,0.65)"
+    accent_bg = "rgba(34,197,94,0.10)"
+    accent_border = "rgba(34,197,94,0.25)"
 
 st.markdown(
     f"""
@@ -355,6 +367,10 @@ html, body, [class*="css"] {{
   font-size: 0.95rem;
   line-height: 1.35rem;
 }}
+.accent {{
+  border: 1px solid {accent_border};
+  background: {accent_bg};
+}}
 button[kind="primary"], button[kind="secondary"] {{
   border-radius: 12px !important;
 }}
@@ -378,14 +394,12 @@ button[kind="primary"], button[kind="secondary"] {{
 st.title("SPY Options Size Checker")
 
 st.markdown(
-    '<div class="card small">'
-    "Phone + desktop friendly. Sizes SPY options from your account balance, "
-    "caps risk around ~1–2% per trade, and aims for small steady account gains "
-    "(0.20%–1.00% net per trade after estimated fees). "
+    '<div class="card accent small">'
+    "<b>Goal:</b> hit a small NET account gain per trade (after estimated fees), "
+    "while keeping the <b>option premium TP% capped</b> so you’re not relying on big contract moves."
     "<br><br>"
     "<b>Trade 1</b>: full deploy & risk tiers. "
-    "<b>Trade 2</b>: half deploy, half risk budget, tighter SL so the second "
-    "trade is always lighter than the first."
+    "<b>Trade 2</b>: half deploy, half risk budget, tighter SL — and cannot size bigger than Trade 1."
     "</div>",
     unsafe_allow_html=True,
 )
@@ -403,7 +417,7 @@ with c1:
     )
 with c2:
     trade_number = st.radio("Trade of the week", [1, 2], horizontal=True)
-st.caption("1 = main trade • 2 = secondary trade (half deploy, half risk budget, tighter SL).")
+st.caption("1 = main trade • 2 = secondary trade (half deploy + half risk).")
 
 c3, c4 = st.columns(2)
 with c3:
@@ -415,27 +429,36 @@ with c3:
         format="%.2f",
     )
 with c4:
-    fee_per_contract = st.number_input(
+    fee_round_trip_per_contract = st.number_input(
         "Estimated fees per contract ($, round trip)",
         min_value=0.00,
-        value=0.04,
+        value=0.08,
         step=0.01,
         format="%.2f",
-        help="Approximate total of all commissions/fees for one contract: buy + sell.",
+        help="Total estimated fees for ONE contract for the whole trade (buy + sell combined).",
     )
 
 st.write("")
 
-# Target account gain slider (always account-based, net-of-fees target)
-default_target_gain = 0.80 if trade_number == 1 else 0.40
-target_gain_pct = st.slider(
-    "Target gain on TOTAL account (%)",
-    min_value=MIN_GOAL_ACCT_GAIN,
-    max_value=MAX_GOAL_ACCT_GAIN,
-    value=default_target_gain,
-    step=0.01,
-    help="All sizing is based on account % gain, not contract %. Range is 0.20%–1.00% per trade.",
-)
+c5, c6 = st.columns(2)
+with c5:
+    target_gain_pct = st.slider(
+        "Target NET gain on TOTAL account (%)",
+        min_value=MIN_GOAL_ACCT_GAIN,
+        max_value=MAX_GOAL_ACCT_GAIN,
+        value=0.80,
+        step=0.01,
+        help="This is NET-of-fees target. Sizing is based on ACCOUNT % gain, not contract %.",
+    )
+with c6:
+    max_tp_premium_pct = st.slider(
+        "Max TP on option premium (%)",
+        min_value=1.0,
+        max_value=20.0,
+        value=8.0,
+        step=0.5,
+        help="Your rule: the contract TP% should not need to exceed this value.",
+    )
 
 # Core calculations
 res = calc(
@@ -443,7 +466,8 @@ res = calc(
     entry_price=entry_price,
     trade_number=trade_number,
     target_gain_pct=target_gain_pct,
-    fee_per_contract=fee_per_contract,
+    fee_round_trip_per_contract=fee_round_trip_per_contract,
+    max_tp_premium_pct=max_tp_premium_pct,
 )
 
 # Summary card
@@ -458,10 +482,11 @@ with s2:
 st.markdown("</div>", unsafe_allow_html=True)
 
 if res["contracts"] == 0:
-    st.warning(
+    msg = res.get("note", "") or (
         "Under your deploy/risk rules, this entry price is too expensive for any contracts "
         "(contracts = 0). Consider a cheaper strike or smaller premium."
     )
+    st.warning(msg)
 
 st.write("")
 
@@ -472,7 +497,8 @@ e1, e2 = st.columns(2)
 e1.metric("TP Price", f'${res["tp_price"]:.2f}')
 e2.metric("SL Price", f'${res["sl_price"]:.2f}')
 st.caption(
-    f"SL % used: {res['sl_pct']:.1f}% • Effective TP % on premium: {res['tp_pct_effective']:.2f}%"
+    f"SL % used: {res['sl_pct']:.1f}% • Effective TP % on premium: {res['tp_pct_effective']:.2f}% "
+    f"(cap: {max_tp_premium_pct:.1f}%)"
 )
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -490,8 +516,8 @@ st.caption(
     f"SL: {res['acct_loss_sl_gross']:.2f}% (based on ACCOUNT balance)."
 )
 st.caption(
-    f"Estimated total fees: ${{res['total_fees_est']:.2f}}  |  "
-    f"Net profit at TP (after est. fees): ${{res['net_profit_tp']:.2f}}  |  "
+    f"Estimated total fees: ${res['total_fees_est']:.2f}  |  "
+    f"Net profit at TP (after est. fees): ${res['net_profit_tp']:.2f}  |  "
     f"Net account gain at TP (after est. fees): {res['acct_gain_tp_net']:.2f}%"
 )
 st.markdown("</div>", unsafe_allow_html=True)
@@ -501,8 +527,8 @@ st.write("")
 # Budgets & limits
 st.subheader("Budgets & Limits")
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.write(f"Deploy budget: **${{res['inv_budget']:.2f}}** • Risk budget: **${{res['rsk_budget']:.2f}}**")
-st.write(f"Cost/contract: **${{res['cost_per_contract']:.2f}}**")
+st.write(f"Deploy budget: **${res['inv_budget']:.2f}** • Risk budget: **${res['rsk_budget']:.2f}**")
+st.write(f"Cost/contract: **${res['cost_per_contract']:.2f}**")
 st.write(
     f"Max contracts by deploy: **{res['max_by_invest']}** • "
     f"Max contracts by risk: **{res['max_by_risk']}**"
@@ -519,7 +545,8 @@ copy_text = (
     f"POS COST ${res['pos_cost']:.2f} | "
     f"P@TP (gross) ${res['profit_tp_gross']:.2f} | "
     f"L@SL (gross) ${res['loss_sl']:.2f} | "
-    f"NET P@TP (after est. fees) ${res['net_profit_tp']:.2f} | "
+    f"FEES (est) ${res['total_fees_est']:.2f} | "
+    f"NET P@TP ${res['net_profit_tp']:.2f} | "
     f"NET ACCT GAIN {res['acct_gain_tp_net']:.2f}%"
 )
 st.code(copy_text, language="text")
