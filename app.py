@@ -358,7 +358,7 @@ with r2c2:
 
 r3c1, r3c2 = st.columns(2)
 with r3c1:
-    tp_cap_pct = st.selectbox("Max contract TP % (premium move cap)", [3.0, 4.0, 8.0], index=2)
+    tp_cap_pct = st.selectbox("Max contract TP % (premium move cap)", [3.0, 4.0, 8.0, 10.0, 12.0, 15.0, 18.0, 20.0], index=2)
 with r3c2:
     default_target = 0.80 if trade_number == 1 else 0.40
     target_gain_pct = st.slider(
